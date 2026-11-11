@@ -1,0 +1,9 @@
+node_modules/
+main.js
+dist/
+.env*
+!.env.example
+.neon
+.superpowers/
+coverage/
+*.local.json

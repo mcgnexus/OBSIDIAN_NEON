@@ -1,0 +1,9 @@
+{
+  "id": "obsidian-neon-sync",
+  "name": "Neon Sync",
+  "version": "0.1.0",
+  "minAppVersion": "1.11.4",
+  "description": "Sincroniza notas Markdown con tu base de datos Neon. Version piloto: requiere configurar roles restringidos.",
+  "author": "Obsidian Neon Sync",
+  "isDesktopOnly": false
+}

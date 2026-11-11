@@ -1,0 +1,22 @@
+{
+  "name": "obsidian-neon-sync",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Personal Markdown vault synchronization over Neon HTTPS",
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --exclude tests/integration/**",
+    "test:integration": "vitest run tests/integration",
+    "test:all": "vitest run"
+  },
+  "dependencies": { "@neondatabase/serverless": "1.2.0" },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.3.14",
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.28.2",
+    "obsidian": "1.14.4",
+    "typescript": "^5.9.3",
+    "vitest": "^5.1.0"
+  }
+}
