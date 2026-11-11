@@ -14,12 +14,26 @@ Plugin personal para sincronizar notas Markdown de un vault de Obsidian entre Wi
 
 ## Instalación
 
-1. Copiar `main.js`, `manifest.json` y `styles.css` (si existe) en `.obsidian/plugins/obsidian-neon-sync/`.
-2. Activar el plugin en Obsidian.
-3. Crear o seleccionar un proyecto Neon y una rama de prueba.
-4. Aplicar `migrations/001_sync.sql` con una conexión administrativa directa.
-5. Crear un rol restringido por dispositivo, asociarlo a `device_access` y otorgar solo ejecución de las funciones de `neon_sync`.
-6. Pegar la URL del rol restringido en los ajustes.
+1. Clonar el repositorio y generar el plugin (main.js está excluido del repositorio):
+
+   ```bash
+   git clone https://github.com/mcgnexus/OBSIDIAN_NEON.git
+   cd OBSIDIAN_NEON
+   npm install
+   npm run build
+   ```
+
+2. Crear un **vault de prueba vacío** en Obsidian (sin notas personales).
+
+3. En la carpeta del vault, crear `.obsidian/plugins/obsidian-neon-sync/` y copiar `main.js` y `manifest.json`.
+
+4. Reiniciar Obsidian. En **Ajustes → Plugins de terceros**, desactivar el modo restringido si aparece y localizar **Neon Sync**.
+
+5. Crear o seleccionar un proyecto Neon y una rama de prueba.
+
+6. Aplicar `migrations/001_sync.sql` con una conexión administrativa directa.
+
+7. Aprovisionar un rol restringido por dispositivo con `migrations/002_device_role_template.sql` y pegar su URL en los ajustes.
 
 ## Advertencias
 

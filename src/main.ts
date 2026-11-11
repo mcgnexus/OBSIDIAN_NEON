@@ -140,7 +140,7 @@ export default class NeonSyncPlugin extends Plugin {
   async syncNow(): Promise<void> {
     if (!this.engine || this.settings.paused) return;
     try { await this.engine.syncOnce(); }
-    catch (e) { new Notice('Error de sincronizacion. Los cambios pendientes se conservan.', 5000); }
+    catch { /* onStatus already reported the error */ }
   }
 
   async loadSettings(): Promise<void> {

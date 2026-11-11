@@ -1,5 +1,4 @@
 export const PROTOCOL = 1;
-export const MAX_NOTE_BYTES = 1024 * 1024;
 export type Revision = string;
 export interface NoteState {
   path: string; content: string | null; hash: string | null; deleted: boolean;
