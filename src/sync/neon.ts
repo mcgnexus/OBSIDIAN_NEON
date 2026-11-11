@@ -25,6 +25,25 @@ export function safeError(error: unknown): SyncError {
 }
 
 export function createNeonStore(url: string): NeonStore {
+  // Prefer Obsidian's requestUrl when available: it bypasses WebView CORS and
+  // uses the native HTTP stack, which is required on mobile.
+  const obsidianFetch = (typeof (globalThis as any).requestUrl === 'function')
+    ? async (input: any, init?: any) => {
+        const r = await (globalThis as any).requestUrl({
+          url: typeof input === 'string' ? input : input.url,
+          method: init?.method ?? 'GET',
+          headers: init?.headers,
+          body: init?.body,
+          throw: false,
+        });
+        return new Response(r.arrayBuffer, { status: r.status, headers: r.headers });
+      }
+    : undefined;
+  if (obsidianFetch) {
+    const cfg = (globalThis as any).neonConfig || {};
+    cfg.fetchFunction = obsidianFetch;
+    (globalThis as any).neonConfig = cfg;
+  }
   const sql = neon(connectionUrl(url), { disableWarningInBrowsers: true });
   return new NeonStore(async (text, params) => {
     const controller = new AbortController();
@@ -38,11 +57,24 @@ export function createNeonStore(url: string): NeonStore {
 export class NeonStore implements RemoteStore {
   constructor(private readonly query: Query) {}
   private async call<T>(sql: string, params: unknown[]): Promise<T> {
-    try {
-      const rows = await this.query(sql, params);
-      if (!rows[0] || !('result' in rows[0])) throw new SyncError('Respuesta de protocolo no valida.');
-      return rows[0].result as T;
-    } catch (error) { throw safeError(error); }
+    const maxAttempts = 5;
+    let attempt = 0;
+    let lastError: unknown;
+    while (attempt < maxAttempts) {
+      try {
+        const rows = await this.query(sql, params);
+        if (!rows[0] || !('result' in rows[0])) throw new SyncError('Respuesta de protocolo no valida.');
+        return rows[0].result as T;
+      } catch (error) {
+        const classified = safeError(error);
+        lastError = classified;
+        if (!classified.retryable || attempt === maxAttempts - 1) throw classified;
+        const delay = Math.min(60_000, 500 * 2 ** attempt) + Math.floor(Math.random() * 250);
+        await new Promise(r => setTimeout(r, delay));
+        attempt++;
+      }
+    }
+    throw safeError(lastError);
   }
   async getManifest(): Promise<Manifest> {
     const manifest = await this.call<Manifest>('select neon_sync.manifest() as result', []);

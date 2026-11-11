@@ -4,20 +4,24 @@ import { createNeonStore } from './sync/neon';
 import { validatePath } from './sync/paths';
 
 interface NeonSyncSettings {
-  connectionUrl: string;
   deviceId: string;
   intervalSeconds: number;
   paused: boolean;
 }
 
 const DEFAULT_SETTINGS: NeonSyncSettings = {
-  connectionUrl: '', deviceId: '', intervalSeconds: 30, paused: false,
+  deviceId: '', intervalSeconds: 30, paused: false,
 };
+
+const SECRET_ID = 'neon-sync-connection-url';
 
 export default class NeonSyncPlugin extends Plugin {
   settings: NeonSyncSettings = { ...DEFAULT_SETTINGS };
+  connectionUrl = '';
   engine: SyncEngine | null = null;
   private timer: number | null = null;
+  private lastInitializedUrl = '';
+  private stateCache: Record<string, unknown> = {};
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -47,7 +51,7 @@ export default class NeonSyncPlugin extends Plugin {
         })();
       }
     }));
-    if (this.settings.connectionUrl) this.initializeEngine();
+    if (this.connectionUrl) this.initializeEngine();
   }
 
   private async captureAndEnqueue(path: string, kind: 'put'): Promise<void> {
@@ -57,12 +61,57 @@ export default class NeonSyncPlugin extends Plugin {
       const file = this.app.vault.getAbstractFileByPath(path);
       if (!file) return;
       const content = await this.app.vault.read(file as any);
-      engine.enqueue({ id: crypto.randomUUID(), device: this.settings.deviceId, kind, path, content });
+      await engine.enqueue({ id: crypto.randomUUID(), device: this.settings.deviceId, kind, path, content });
     } catch { /* ignore read errors */ }
   }
 
+  private async loadPersistedState(): Promise<Record<string, unknown>> {
+    try {
+      const data = await this.loadData();
+      return (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
+    } catch { return {}; }
+  }
+
+  private makeStateStore(): {
+    get: <T>(k: string) => Promise<T | null>;
+    set: <T>(k: string, v: T) => Promise<void>;
+    remove: (k: string) => Promise<void>;
+  } {
+    const vaultKey = this.app.vault.getName();
+    const prefix = 'neon-sync:' + vaultKey + ':';
+    return {
+      get: async <T>(k: string) => {
+        const key = prefix + k;
+        if (Object.prototype.hasOwnProperty.call(this.stateCache, key)) return this.stateCache[key] as T | null;
+        try {
+          const all = await this.loadData();
+          const v = all && typeof all === 'object' ? (all as any)[key] : null;
+          this.stateCache[key] = v;
+          return v as T | null;
+        } catch { return null; }
+      },
+      set: async <T>(k: string, v: T) => {
+        const key = prefix + k;
+        this.stateCache[key] = v;
+        const all = (await this.loadData()) as Record<string, unknown> || {};
+        all[key] = v;
+        await this.saveData(all);
+      },
+      remove: async (k: string) => {
+        const key = prefix + k;
+        delete this.stateCache[key];
+        const all = (await this.loadData()) as Record<string, unknown> || {};
+        delete all[key];
+        await this.saveData(all);
+      },
+    };
+  }
+
   initializeEngine(): void {
-    const store = createNeonStore(this.settings.connectionUrl);
+    if (!this.connectionUrl || this.connectionUrl === this.lastInitializedUrl) return;
+    this.lastInitializedUrl = this.connectionUrl;
+    const store = createNeonStore(this.connectionUrl);
+    const stateStore = this.makeStateStore();
     this.engine = new SyncEngine({
       vault: {
         listMarkdown: async () => this.app.vault.getMarkdownFiles().map(f => f.path),
@@ -74,7 +123,7 @@ export default class NeonSyncPlugin extends Plugin {
         exists: async (p) => !!this.app.vault.getAbstractFileByPath(p),
         hash: async (c) => { const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(c)); return Array.from(new Uint8Array(d), b => b.toString(16).padStart(2, '0')).join(''); },
       },
-      state: { get: (k) => { try { return JSON.parse(localStorage.getItem('neon-sync:' + k) ?? 'null'); } catch { return null; } }, set: (k, v) => localStorage.setItem('neon-sync:' + k, JSON.stringify(v)), remove: (k) => localStorage.removeItem('neon-sync:' + k) },
+      state: stateStore as any,
       remote: store as any,
       deviceId: this.settings.deviceId,
       onStatus: (s) => new Notice(s, 3000),
@@ -94,8 +143,28 @@ export default class NeonSyncPlugin extends Plugin {
     catch (e) { new Notice('Error de sincronizacion. Los cambios pendientes se conservan.', 5000); }
   }
 
-  async loadSettings(): Promise<void> { this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); }
-  async saveSettings(): Promise<void> { await this.saveData(this.settings); }
+  async loadSettings(): Promise<void> {
+    const data = (await this.loadData()) as Record<string, unknown> | null;
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, data ?? {});
+    // Read secret from SecretStorage (preferred) with fallback to legacy data.json.
+    try {
+      const secret = await (this.app as any).secretStorage?.getSecret?.(SECRET_ID);
+      if (secret) this.connectionUrl = secret;
+      else if (data && typeof data.connectionUrl === 'string') this.connectionUrl = data.connectionUrl as string;
+    } catch {
+      if (data && typeof data.connectionUrl === 'string') this.connectionUrl = data.connectionUrl as string;
+    }
+  }
+
+  async saveSettings(): Promise<void> {
+    // Never persist the connection URL in data.json.
+    const { connectionUrl: _ignored, ...rest } = this.settings as any;
+    await this.saveData({ ...rest, ...this.stateCache });
+    try {
+      if (this.connectionUrl) await (this.app as any).secretStorage?.setSecret?.(SECRET_ID, this.connectionUrl);
+    } catch { /* ignore */ }
+    if (this.connectionUrl && this.connectionUrl !== this.lastInitializedUrl) this.initializeEngine();
+  }
 
   onunload(): void { if (this.timer) window.clearInterval(this.timer); }
 }
@@ -105,7 +174,7 @@ class NeonSyncSettingTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
-    new Setting(containerEl).setName('URL de conexion').setDesc('URL PostgreSQL de un rol restringido de Neon. El contenido se almacena como texto legible.').addText(t => t.setValue(this.plugin.settings.connectionUrl).onChange(async v => { this.plugin.settings.connectionUrl = v; await this.plugin.saveSettings(); if (v) this.plugin.initializeEngine(); }));
+    new Setting(containerEl).setName('URL de conexion').setDesc('URL PostgreSQL de un rol restringido de Neon. Se guarda en el almacenamiento de secretos de Obsidian, no en data.json.').addText(t => t.setValue(this.plugin.connectionUrl).onChange(async v => { this.plugin.connectionUrl = v; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName('Intervalo (segundos)').addText(t => t.setValue(String(this.plugin.settings.intervalSeconds)).onChange(async v => { const n = Number(v); if (n >= 10) { this.plugin.settings.intervalSeconds = n; await this.plugin.saveSettings(); } }));
     new Setting(containerEl).setName('Pausar').addToggle(t => t.setValue(this.plugin.settings.paused).onChange(async v => { this.plugin.settings.paused = v; if (v) this.plugin.engine?.pause(); else this.plugin.engine?.resume(); await this.plugin.saveSettings(); if (!v && this.plugin.engine) this.plugin['startTimer'](); }));
     new Setting(containerEl).setName('Sincronizar ahora').addButton(b => b.setButtonText('Sincronizar').onClick(() => void this.plugin.syncNow()));
