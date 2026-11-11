@@ -33,6 +33,7 @@ export interface SyncEngineOptions {
   remote: RemoteStoreLike;
   deviceId: string;
   onStatus?: (status: string) => void;
+  onConflict?: (paths: string[]) => void;
 }
 
 export class SyncEngine {
@@ -48,35 +49,80 @@ export class SyncEngine {
     if (this.running || this.paused) return;
     this.running = true;
     try {
-      const cursor = this.options.state.get<Revision>('cursor') ?? '0';
+      const cursorBefore = this.options.state.get<Revision>('cursor') ?? '0';
       const pending = this.options.state.get<Operation[]>('queue') ?? [];
-      // Push local changes first, in order.
-      const newQueue: Operation[] = [];
+      const baseHashes = this.options.state.get<Record<string, string>>('baseHashes') ?? {};
+      // Paths with a pending local operation are "dirty": never overwrite them on pull.
+      const dirty = new Set(pending.map(o => o.path).concat(pending.filter(o => o.destination).map(o => o.destination!)));
+
+      // Bootstrap on first run: reconcile local-only and remote-only notes, skip true conflicts.
+      const bootstrapped = this.options.state.get<boolean>('bootstrapped') ?? false;
+      if (!bootstrapped) {
+        await this.bootstrap(cursorBefore, baseHashes);
+        this.options.state.set('bootstrapped', true);
+        this.options.onStatus?.('Sincronizacion inicial completada');
+        this.running = false;
+        return;
+      }
+
+      // 1. Push pending local changes first (idempotent by operation id). Read fresh content at send time.
+      const pushedIds = new Set<string>();
       for (const op of pending) {
         try {
+          if (op.kind === 'put') {
+            if (!(await this.options.vault.exists(op.path))) {
+              op.kind = 'delete';
+              delete op.content;
+            } else {
+              op.content = await this.options.vault.read(op.path);
+            }
+          }
           const receipt = await this.options.remote.apply(op);
-          this.options.state.set('cursor', receipt.revision);
-        } catch (error) {
-          newQueue.push(op);
-          throw error;
+          pushedIds.add(op.id);
+          // Do NOT advance cursor here: other devices' revisions must still be pulled.
+        } catch {
+          // Leave op in queue (merged below); abort push phase but keep pulling.
+          break;
         }
       }
-      this.options.state.set('queue', newQueue);
-      // Pull remote changes.
-      let currentCursor = this.options.state.get<Revision>('cursor') ?? '0';
-      const changes = await this.options.remote.readChanges(currentCursor, 100);
+      // Merge: keep ops enqueued during this cycle that were not successfully pushed.
+      const currentQueue = this.options.state.get<Operation[]>('queue') ?? [];
+      const remaining = currentQueue.filter(o => !pushedIds.has(o.id));
+      this.options.state.set('queue', remaining);
+
+      // 2. Pull remote changes, but never overwrite dirty paths. Advance cursor only per applied change.
+      let cursor = cursorBefore;
+      const changes = await this.options.remote.readChanges(cursor, 100);
+      const conflicts: string[] = [];
       for (const change of changes) {
+        if (dirty.has(change.path)) {
+          // Defer: stop pulling further changes until the dirty path resolves.
+          conflicts.push(change.path);
+          break;
+        }
         if (change.deleted) {
           if (await this.options.vault.exists(change.path)) await this.options.vault.trash(change.path);
+          delete baseHashes[change.path];
         } else if (change.content !== null) {
-          const local = await this.options.vault.exists(change.path) ? await this.options.vault.read(change.path) : null;
-          if (local === null || await this.options.vault.hash(local) !== (await this.options.vault.hash(change.content))) {
+          const localExists = await this.options.vault.exists(change.path);
+          const local = localExists ? await this.options.vault.read(change.path) : null;
+          const localHash = local === null ? null : await this.options.vault.hash(local);
+          // Only write if local differs (or absent); never clobber an unsynced local edit.
+          if (local === null || localHash !== change.hash) {
+            // Extra guard: if a local file exists whose hash differs from base, it is an unsynced edit.
+            if (localExists && baseHashes[change.path] && baseHashes[change.path] !== localHash) {
+              conflicts.push(change.path);
+              break;
+            }
             await this.options.vault.write(change.path, change.content);
           }
+          baseHashes[change.path] = change.hash ?? '';
         }
-        currentCursor = change.revision;
+        cursor = change.revision;
       }
-      this.options.state.set('cursor', currentCursor);
+      if (conflicts.length) this.options.onConflict?.(conflicts);
+      this.options.state.set('cursor', cursor);
+      this.options.state.set('baseHashes', baseHashes);
       await this.options.remote.cleanup().catch(() => undefined);
       this.options.onStatus?.('Sincronizado');
     } catch (error) {
@@ -85,6 +131,59 @@ export class SyncEngine {
     } finally {
       this.running = false;
     }
+  }
+
+  private async bootstrap(cursorBefore: Revision, baseHashes: Record<string, string>): Promise<void> {
+    const manifest = await this.options.remote.getManifest();
+    const remotePaths = new Set(manifest.notes.map(n => n.path));
+    const localPaths = await this.options.vault.listMarkdown();
+    const localSet = new Set(localPaths);
+    const conflicts: string[] = [];
+
+    // Upload local-only notes.
+    for (const p of localPaths) {
+      if (!remotePaths.has(p)) {
+        const content = await this.options.vault.read(p);
+        this.enqueue({ id: crypto.randomUUID(), device: this.options.deviceId, kind: 'put', path: p, content });
+      }
+    }
+    // Download remote-only notes.
+    for (const n of manifest.notes) {
+      if (!localSet.has(n.path) && !n.deleted) {
+        const note = await this.options.remote.getNote(n.path);
+        if (note && note.content !== null) {
+          await this.options.vault.write(n.path, note.content);
+          baseHashes[n.path] = note.hash ?? '';
+        }
+      }
+    }
+    // Conflicts: present on both with differing hash — skip both directions.
+    for (const n of manifest.notes) {
+      if (localSet.has(n.path) && !n.deleted) {
+        const local = await this.options.vault.read(n.path);
+        const localHash = await this.options.vault.hash(local);
+        if (n.hash !== null && n.hash !== localHash) conflicts.push(n.path);
+      }
+    }
+    if (conflicts.length) this.options.onConflict?.(conflicts);
+    this.options.state.set('cursor', manifest.revision);
+    this.options.state.set('baseHashes', baseHashes);
+    // Push the queued local-only uploads immediately so the first sync converges.
+    const queued = this.options.state.get<Operation[]>('queue') ?? [];
+    const pushedIds = new Set<string>();
+    for (const op of queued) {
+      try {
+        if (op.kind === 'put' && (await this.options.vault.exists(op.path))) {
+          op.content = await this.options.vault.read(op.path);
+        }
+        const receipt = await this.options.remote.apply(op);
+        pushedIds.add(op.id);
+      } catch {
+        break;
+      }
+    }
+    const currentQueue = this.options.state.get<Operation[]>('queue') ?? [];
+    this.options.state.set('queue', currentQueue.filter(o => !pushedIds.has(o.id)));
   }
 
   enqueue(operation: Operation): void {

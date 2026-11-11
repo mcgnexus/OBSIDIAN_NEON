@@ -1,18 +1,17 @@
-import { App, Plugin, PluginSettingTab, Setting, Notice, WorkspaceLeaf } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, Notice } from 'obsidian';
 import { SyncEngine } from './sync/engine';
 import { createNeonStore } from './sync/neon';
 import { validatePath } from './sync/paths';
 
 interface NeonSyncSettings {
   connectionUrl: string;
-  vaultId: string;
   deviceId: string;
   intervalSeconds: number;
   paused: boolean;
 }
 
 const DEFAULT_SETTINGS: NeonSyncSettings = {
-  connectionUrl: '', vaultId: '', deviceId: '', intervalSeconds: 30, paused: false,
+  connectionUrl: '', deviceId: '', intervalSeconds: 30, paused: false,
 };
 
 export default class NeonSyncPlugin extends Plugin {
@@ -28,15 +27,41 @@ export default class NeonSyncPlugin extends Plugin {
     }
     this.addCommand({ id: 'sync-now', name: 'Sincronizar ahora', callback: () => void this.syncNow() });
     this.addSettingTab(new NeonSyncSettingTab(this.app, this));
+    const isMd = (p: string) => p.endsWith('.md') && validatePath(p);
+    this.registerEvent(this.app.vault.on('create', (file) => {
+      if (isMd(file.path)) void this.captureAndEnqueue(file.path, 'put');
+    }));
     this.registerEvent(this.app.vault.on('modify', (file) => {
-      if (file.path.endsWith('.md') && validatePath(file.path)) {
-        this.engine?.enqueue({ id: crypto.randomUUID(), device: this.settings.deviceId, kind: 'put', path: file.path, content: '' });
+      if (isMd(file.path)) void this.captureAndEnqueue(file.path, 'put');
+    }));
+    this.registerEvent(this.app.vault.on('delete', (file) => {
+      if (isMd(file.path)) this.engine?.enqueue({ id: crypto.randomUUID(), device: this.settings.deviceId, kind: 'delete', path: file.path });
+    }));
+    this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
+      if (isMd(file.path) && isMd(oldPath)) {
+        void (async () => {
+          try {
+            const content = await this.app.vault.read(file as any);
+            this.engine?.enqueue({ id: crypto.randomUUID(), device: this.settings.deviceId, kind: 'rename', path: oldPath, destination: file.path, content });
+          } catch { /* ignore */ }
+        })();
       }
     }));
     if (this.settings.connectionUrl) this.initializeEngine();
   }
 
-  private initializeEngine(): void {
+  private async captureAndEnqueue(path: string, kind: 'put'): Promise<void> {
+    const engine = this.engine;
+    if (!engine) return;
+    try {
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (!file) return;
+      const content = await this.app.vault.read(file as any);
+      engine.enqueue({ id: crypto.randomUUID(), device: this.settings.deviceId, kind, path, content });
+    } catch { /* ignore read errors */ }
+  }
+
+  initializeEngine(): void {
     const store = createNeonStore(this.settings.connectionUrl);
     this.engine = new SyncEngine({
       vault: {
@@ -53,6 +78,7 @@ export default class NeonSyncPlugin extends Plugin {
       remote: store as any,
       deviceId: this.settings.deviceId,
       onStatus: (s) => new Notice(s, 3000),
+      onConflict: (paths) => new Notice('Conflictos no resueltos: ' + paths.join(', '), 8000),
     });
     if (!this.settings.paused) this.startTimer();
   }
@@ -69,7 +95,7 @@ export default class NeonSyncPlugin extends Plugin {
   }
 
   async loadSettings(): Promise<void> { this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); }
-  async saveSettings(): Promise<void> { await this.saveData(this.settings); if (this.settings.connectionUrl) this.initializeEngine(); }
+  async saveSettings(): Promise<void> { await this.saveData(this.settings); }
 
   onunload(): void { if (this.timer) window.clearInterval(this.timer); }
 }
@@ -79,9 +105,9 @@ class NeonSyncSettingTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
-    new Setting(containerEl).setName('URL de conexion').setDesc('URL PostgreSQL de un rol restringido de Neon. El contenido se almacena como texto legible.').addText(t => t.setValue(this.plugin.settings.connectionUrl).onChange(async v => { this.plugin.settings.connectionUrl = v; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('URL de conexion').setDesc('URL PostgreSQL de un rol restringido de Neon. El contenido se almacena como texto legible.').addText(t => t.setValue(this.plugin.settings.connectionUrl).onChange(async v => { this.plugin.settings.connectionUrl = v; await this.plugin.saveSettings(); if (v) this.plugin.initializeEngine(); }));
     new Setting(containerEl).setName('Intervalo (segundos)').addText(t => t.setValue(String(this.plugin.settings.intervalSeconds)).onChange(async v => { const n = Number(v); if (n >= 10) { this.plugin.settings.intervalSeconds = n; await this.plugin.saveSettings(); } }));
-    new Setting(containerEl).setName('Pausar').addToggle(t => t.setValue(this.plugin.settings.paused).onChange(async v => { this.plugin.settings.paused = v; if (v) this.plugin.engine?.pause(); else this.plugin.engine?.resume(); await this.plugin.saveSettings(); if (!v) this.plugin['startTimer'](); }));
+    new Setting(containerEl).setName('Pausar').addToggle(t => t.setValue(this.plugin.settings.paused).onChange(async v => { this.plugin.settings.paused = v; if (v) this.plugin.engine?.pause(); else this.plugin.engine?.resume(); await this.plugin.saveSettings(); if (!v && this.plugin.engine) this.plugin['startTimer'](); }));
     new Setting(containerEl).setName('Sincronizar ahora').addButton(b => b.setButtonText('Sincronizar').onClick(() => void this.plugin.syncNow()));
     containerEl.createEl('p', { text: 'Advertencia: el contenido es legible en Neon, la credencial es accesible desde este dispositivo y la sincronizacion automatica puede mantener el compute activo. La ultima operacion nueva gana, incluidos borrados.' });
   }
